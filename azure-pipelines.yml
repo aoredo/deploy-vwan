@@ -1,0 +1,345 @@
+trigger:
+  branches:
+    include:
+      - ea-np      # Non-production (dev/staging) branch
+      - ea-prd     # Production branch
+  paths:
+    include:
+      - '*.tf'
+      - 'terraform.tfvars'
+      - 'azure-pipelines.yml'
+    exclude:
+      - '*.md'
+      - '.gitignore'
+
+pr:
+  branches:
+    include:
+      - ea-np      # Pull requests to non-prod
+      - ea-prd     # Pull requests to prod
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  terraformVersion: '1.5.0'
+  azureSubscriptionEndpoint: 'Azure-Terraform-SP'  # Service Connection name
+  backendResourceGroup: 'rg-terraform-state'
+  backendStorageAccount: 'stterraformstate'
+  backendContainerName: 'tfstate'
+
+stages:
+  # Stage 1: Determine Environment
+  - stage: DetermineEnvironment
+    displayName: 'Determine Environment'
+    jobs:
+      - job: SetEnvironment
+        displayName: 'Set Environment Variables'
+        steps:
+          - script: |
+              if [[ "$(Build.SourceBranch)" == "refs/heads/ea-prd" ]]; then
+                echo "##vso[task.setvariable variable=environment;isOutput=true]prod"
+                echo "##vso[task.setvariable variable=backendKey;isOutput=true]vwan-prd/terraform.tfstate"
+                echo "##vso[task.setvariable variable=resourceGroup;isOutput=true]rg-vwan-prd"
+                echo "##vso[task.setvariable variable=location;isOutput=true]eastus"
+                echo "Environment: PRODUCTION"
+              else
+                echo "##vso[task.setvariable variable=environment;isOutput=true]nonprod"
+                echo "##vso[task.setvariable variable=backendKey;isOutput=true]vwan-nonprod/terraform.tfstate"
+                echo "##vso[task.setvariable variable=resourceGroup;isOutput=true]rg-vwan-nonprod"
+                echo "##vso[task.setvariable variable=location;isOutput=true]eastus"
+                echo "Environment: NON-PRODUCTION (Development/Testing)"
+              fi
+            displayName: 'Determine Environment from Branch'
+            name: EnvVars
+
+  # Stage 2: Validate and Plan (runs on PR and push to both branches)
+  - stage: Validate
+    displayName: 'Validate & Plan'
+    dependsOn: DetermineEnvironment
+    variables:
+      environment: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.environment'] ]
+      backendKey: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.backendKey'] ]
+      resourceGroup: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.resourceGroup'] ]
+    jobs:
+      - job: TerraformValidate
+        displayName: 'Terraform Validate'
+        steps:
+          - task: TerraformInstaller@0
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Init (Validate)'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+              backendServiceArm: $(azureSubscriptionEndpoint)
+              backendAzureRmResourceGroupName: $(backendResourceGroup)
+              backendAzureRmStorageAccountName: $(backendStorageAccount)
+              backendAzureRmContainerName: $(backendContainerName)
+              backendAzureRmKey: $(backendKey)
+
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Validate'
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Format Check'
+            inputs:
+              provider: 'azurerm'
+              command: 'custom'
+              customCommand: 'fmt'
+              customArguments: '-check -recursive'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+            continueOnError: true
+
+      - job: TerraformPlan
+        displayName: 'Terraform Plan'
+        dependsOn: TerraformValidate
+        condition: succeeded()
+        steps:
+          - task: TerraformInstaller@0
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Init (Plan)'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+              backendServiceArm: $(azureSubscriptionEndpoint)
+              backendAzureRmResourceGroupName: $(backendResourceGroup)
+              backendAzureRmStorageAccountName: $(backendStorageAccount)
+              backendAzureRmContainerName: $(backendContainerName)
+              backendAzureRmKey: $(backendKey)
+
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Plan - $(environment)'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+              commandOptions: '-out=tfplan -var-file=terraform.tfvars'
+              environmentServiceNameAzureRM: $(azureSubscriptionEndpoint)
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Plan Artifact'
+            inputs:
+              pathToPublish: '$(System.DefaultWorkingDirectory)'
+              artifactName: 'tfplan-$(environment)'
+              publishLocation: 'Container'
+            condition: succeeded()
+
+  # Stage 3: Security Scanning
+  - stage: Security
+    displayName: 'Security Scan'
+    condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/ea-np'), eq(variables['Build.SourceBranch'], 'refs/heads/ea-prd'), startsWith(variables['System.PullRequest.SourceBranch'], 'refs/pull'))
+    dependsOn: []
+    jobs:
+      - job: TFSec
+        displayName: 'TFSec Security Scan'
+        steps:
+          - script: |
+              docker run --rm -v $(System.DefaultWorkingDirectory):/root aquasec/tfsec:latest /root -f json > $(System.DefaultWorkingDirectory)/tfsec-report.json || true
+            displayName: 'Run TFSec'
+            continueOnError: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Security Report'
+            inputs:
+              pathToPublish: '$(System.DefaultWorkingDirectory)/tfsec-report.json'
+              artifactName: 'security-report'
+            condition: succeeded()
+            continueOnError: true
+
+  # Stage 4: Non-Prod Auto-Deploy (ea-np branch only, no approval)
+  - stage: ApplyNonProd
+    displayName: 'Deploy Non-Production'
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/ea-np'), ne(variables['Build.Reason'], 'PullRequest'))
+    dependsOn: [DetermineEnvironment, Validate]
+    variables:
+      environment: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.environment'] ]
+      backendKey: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.backendKey'] ]
+      resourceGroup: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.resourceGroup'] ]
+    jobs:
+      - job: DeployNonProd
+        displayName: 'Auto-Deploy to Non-Prod (No Approval Required)'
+        steps:
+          - checkout: self
+          - task: TerraformInstaller@0
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          - task: DownloadBuildArtifacts@0
+            displayName: 'Download Plan Artifact'
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'tfplan-nonprod'
+              downloadPath: '$(System.DefaultWorkingDirectory)'
+
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+              backendServiceArm: $(azureSubscriptionEndpoint)
+              backendAzureRmResourceGroupName: $(backendResourceGroup)
+              backendAzureRmStorageAccountName: $(backendStorageAccount)
+              backendAzureRmContainerName: $(backendContainerName)
+              backendAzureRmKey: $(backendKey)
+
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Apply - Non-Prod'
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+              commandOptions: '-input=false tfplan'
+              environmentServiceNameAzureRM: $(azureSubscriptionEndpoint)
+
+          - script: |
+              terraform show -json > $(System.DefaultWorkingDirectory)/terraform-output.json
+              terraform output > $(System.DefaultWorkingDirectory)/terraform-output.txt
+            displayName: 'Export Terraform Output'
+            workingDirectory: '$(System.DefaultWorkingDirectory)'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Deployment Output'
+            inputs:
+              pathToPublish: '$(System.DefaultWorkingDirectory)/terraform-output.txt'
+              artifactName: 'deployment-output-nonprod'
+
+  # Stage 5: Production Deploy (ea-prd branch only, requires approval)
+  - stage: ApplyProd
+    displayName: 'Deploy Production'
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/ea-prd'), ne(variables['Build.Reason'], 'PullRequest'))
+    dependsOn: [DetermineEnvironment, Validate]
+    variables:
+      environment: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.environment'] ]
+      backendKey: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.backendKey'] ]
+      resourceGroup: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.resourceGroup'] ]
+    jobs:
+      - deployment: ApproveAndDeployProd
+        displayName: 'Approve & Deploy to Production'
+        environment: 'Production'  # Azure DevOps environment for approval
+        strategy:
+          runOnce:
+            preDeploy:
+              steps:
+                - checkout: self
+                - task: TerraformInstaller@0
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(terraformVersion)
+
+                - task: DownloadBuildArtifacts@0
+                  displayName: 'Download Plan Artifact'
+                  inputs:
+                    buildType: 'current'
+                    downloadType: 'single'
+                    artifactName: 'tfplan-prod'
+                    downloadPath: '$(System.DefaultWorkingDirectory)'
+
+                - script: |
+                    echo "=== Production Deployment Plan ==="
+                    cat $(System.DefaultWorkingDirectory)/tfplan || echo "Plan file not found"
+                  displayName: 'Display Plan for Approval'
+
+            deploy:
+              steps:
+                - checkout: self
+                - task: TerraformInstaller@0
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(terraformVersion)
+
+                - task: TerraformTaskV3@3
+                  displayName: 'Terraform Init (Prod)'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    workingDirectory: '$(System.DefaultWorkingDirectory)'
+                    backendServiceArm: $(azureSubscriptionEndpoint)
+                    backendAzureRmResourceGroupName: $(backendResourceGroup)
+                    backendAzureRmStorageAccountName: $(backendStorageAccount)
+                    backendAzureRmContainerName: $(backendContainerName)
+                    backendAzureRmKey: $(backendKey)
+
+                - task: TerraformTaskV3@3
+                  displayName: 'Terraform Apply - Production'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    workingDirectory: '$(System.DefaultWorkingDirectory)'
+                    commandOptions: '-input=false tfplan'
+                    environmentServiceNameAzureRM: $(azureSubscriptionEndpoint)
+
+                - script: |
+                    terraform show -json > $(System.DefaultWorkingDirectory)/terraform-output.json
+                    terraform output > $(System.DefaultWorkingDirectory)/terraform-output.txt
+                  displayName: 'Export Terraform Output'
+                  workingDirectory: '$(System.DefaultWorkingDirectory)'
+
+                - task: PublishBuildArtifacts@1
+                  displayName: 'Publish Deployment Output'
+                  inputs:
+                    pathToPublish: '$(System.DefaultWorkingDirectory)/terraform-output.txt'
+                    artifactName: 'deployment-output-prod'
+
+  # Stage 6: Post-Deployment Validation
+  - stage: PostDeploy
+    displayName: 'Post-Deployment Validation'
+    condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/ea-np'), eq(variables['Build.SourceBranch'], 'refs/heads/ea-prd')))
+    dependsOn: [DetermineEnvironment, ApplyNonProd, ApplyProd]
+    variables:
+      environment: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.environment'] ]
+      resourceGroup: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.resourceGroup'] ]
+    jobs:
+      - job: ValidateDeployment
+        displayName: 'Validate Deployed Resources'
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Check Firewall Status'
+            inputs:
+              azureSubscription: $(azureSubscriptionEndpoint)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Environment: $(environment)"
+                echo "Checking Azure Firewall status..."
+                az firewall show \
+                  --resource-group "$(resourceGroup)" \
+                  --name "afw-*-eastus" \
+                  --query "{name:name, provisioning_state:provisioningState}" \
+                  -o table || echo "Firewall not yet deployed"
+
+          - task: AzureCLI@2
+            displayName: 'Check vWAN Hub Status'
+            inputs:
+              azureSubscription: $(azureSubscriptionEndpoint)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Checking Virtual Hub status..."
+                az network vhub list --resource-group "$(resourceGroup)" --output table || echo "Hub not yet deployed"
+
+          - task: AzureCLI@2
+            displayName: 'Check Virtual Networks'
+            inputs:
+              azureSubscription: $(azureSubscriptionEndpoint)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Checking Virtual Networks..."
+                az network vnet list --resource-group "$(resourceGroup)" --output table || echo "vNets not yet deployed"

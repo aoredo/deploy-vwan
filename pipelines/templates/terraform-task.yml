@@ -1,0 +1,26 @@
+steps:
+  - task: TerraformInstaller@0
+    displayName: 'Install Terraform v${{ parameters.terraformVersion }}'
+    inputs:
+      terraformVersion: ${{ parameters.terraformVersion }}
+
+  - task: TerraformTaskV3@3
+    displayName: 'Terraform Init'
+    inputs:
+      provider: 'azurerm'
+      command: 'init'
+      workingDirectory: '$(System.DefaultWorkingDirectory)'
+      backendServiceArm: ${{ parameters.azureSubscriptionEndpoint }}
+      backendAzureRmResourceGroupName: ${{ parameters.backendResourceGroup }}
+      backendAzureRmStorageAccountName: ${{ parameters.backendStorageAccount }}
+      backendAzureRmContainerName: ${{ parameters.backendContainerName }}
+      backendAzureRmKey: ${{ parameters.backendKey }}
+
+  - task: TerraformTaskV3@3
+    displayName: 'Terraform ${{ parameters.command }}'
+    inputs:
+      provider: 'azurerm'
+      command: ${{ parameters.command }}
+      workingDirectory: '$(System.DefaultWorkingDirectory)'
+      environmentServiceNameAzureRM: ${{ parameters.azureSubscriptionEndpoint }}
+      commandOptions: ${{ parameters.commandOptions }}

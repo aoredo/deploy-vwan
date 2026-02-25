@@ -1,0 +1,57 @@
+steps:
+  - task: AzureCLI@2
+    displayName: 'Validate Azure Connectivity'
+    inputs:
+      azureSubscription: ${{ parameters.azureSubscriptionEndpoint }}
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        echo "Current Azure Context:"
+        az account show -o table
+        
+        echo -e "\nAvailable Subscriptions:"
+        az account list --output table
+
+  - task: AzureCLI@2
+    displayName: 'Validate Resource Group'
+    inputs:
+      azureSubscription: ${{ parameters.azureSubscriptionEndpoint }}
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        RG_NAME="${{ parameters.resourceGroupName }}"
+        echo "Checking resource group: $RG_NAME"
+        
+        if az group exists --name "$RG_NAME" | grep -q true; then
+          echo "✓ Resource group exists"
+          az group show --name "$RG_NAME" -o table
+        else
+          echo "✗ Resource group does not exist yet (will be created)"
+        fi
+
+  - task: AzureCLI@2
+    displayName: 'Validate Storage Account Access'
+    inputs:
+      azureSubscription: ${{ parameters.azureSubscriptionEndpoint }}
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        STORAGE_RG="${{ parameters.backendResourceGroup }}"
+        STORAGE_ACCOUNT="${{ parameters.backendStorageAccount }}"
+        CONTAINER_NAME="${{ parameters.backendContainerName }}"
+        
+        echo "Checking Terraform state storage..."
+        
+        if az storage account show --resource-group "$STORAGE_RG" --name "$STORAGE_ACCOUNT" &>/dev/null; then
+          echo "✓ Storage account exists"
+          
+          if az storage container exists --account-name "$STORAGE_ACCOUNT" --name "$CONTAINER_NAME" | grep -q true; then
+            echo "✓ Container exists"
+          else
+            echo "✗ Container does not exist"
+            exit 1
+          fi
+        else
+          echo "✗ Storage account does not exist"
+          exit 1
+        fi
