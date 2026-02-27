@@ -19,7 +19,9 @@ pr:
       - ea-prd     # Pull requests to prod
 
 pool:
-  vmImage: 'ubuntu-latest'
+  name: 'Default'
+  demands:
+    - agent.name -equals vwan-simple-agent
 
 variables:
   terraformVersion: '1.5.0'
@@ -143,6 +145,10 @@ stages:
     displayName: 'Security Scan'
     condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/ea-np'), eq(variables['Build.SourceBranch'], 'refs/heads/ea-prd'), startsWith(variables['System.PullRequest.SourceBranch'], 'refs/pull'))
     dependsOn: []
+    pool:
+      name: 'Default'
+      demands:
+        - agent.name -equals vwan-simple-agent
     jobs:
       - job: TFSec
         displayName: 'TFSec Security Scan'
@@ -165,6 +171,10 @@ stages:
     displayName: 'Deploy Non-Production'
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/ea-np'), ne(variables['Build.Reason'], 'PullRequest'))
     dependsOn: [DetermineEnvironment, Validate]
+    pool:
+      name: 'Default'
+      demands:
+        - agent.name -equals vwan-simple-agent
     variables:
       environment: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.environment'] ]
       backendKey: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.backendKey'] ]
@@ -225,6 +235,10 @@ stages:
     displayName: 'Deploy Production'
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/ea-prd'), ne(variables['Build.Reason'], 'PullRequest'))
     dependsOn: [DetermineEnvironment, Validate]
+    pool:
+      name: 'Default'
+      demands:
+        - agent.name -equals vwan-simple-agent
     variables:
       environment: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.environment'] ]
       backendKey: $[ stageDependencies.DetermineEnvironment.SetEnvironment.outputs['EnvVars.backendKey'] ]
